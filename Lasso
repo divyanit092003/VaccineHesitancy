@@ -1,0 +1,70 @@
+library(tidyverse)
+library(tidymodels)
+library(themis)
+library(glmnet)
+set.seed(123)
+
+df <- read_csv("outputs_vax_model_table.csv") %>% clean_names()
+
+# Quick sanity filter: keep rows with non-missing target
+df <- df %>% filter(!is.na(icu_high))
+
+# Train/test split
+split_obj <- initial_split(df, strata = icu_high)
+train_df  <- training(split_obj)
+test_df   <- testing(split_obj)
+cv_folds  <- vfold_cv(train_df, v = 5, strata = icu_high)
+
+# Recipe: encode disease + age_group, normalize numeric, handle imbalance if any
+rec <- recipe(icu_high ~ disease + age_group + admissions + icu_pct, data = train_df) %>%
+  step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_adasyn(icu_high, over_ratio = 0.5)
+
+# LASSO spec
+lasso_spec <- logistic_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+wf <- workflow() %>% add_recipe(rec) %>% add_model(lasso_spec)
+
+lambda_grid <- grid_regular(penalty(range = c(-4, 0)), levels = 30)
+
+lasso_tune <- tune_grid(
+  wf, resamples = cv_folds, grid = lambda_grid,
+  metrics = metric_set(roc_auc, accuracy, sens, spec)
+)
+
+best <- select_best(lasso_tune, metric = "roc_auc")
+final_wf <- finalize_workflow(wf, best)
+
+fit <- fit(final_wf, data = train_df)
+pred <- augment(fit, new_data = test_df)
+
+metrics <- metric_set(roc_auc, accuracy, sens, spec)(pred, truth = icu_high, estimate = .pred_class, .pred_1)
+
+# Coefficients for interpretability
+coefs <- tidy(extract_fit_parsnip(fit)) %>%
+  arrange(desc(abs(estimate)))
+
+# Plots for slides
+roc_plot <- pred %>%
+  roc_curve(truth = icu_high, .pred_1, event_level = "second") %>%
+  autoplot() + ggtitle("ROC — LASSO (Predicting ICU High)")
+
+cm <- conf_mat(pred, truth = icu_high, estimate = .pred_class)
+cm_df <- as.data.frame(cm$table)
+cm_plot <- ggplot(cm_df, aes(x = Truth, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 6) +
+  theme_minimal() + guides(fill = "none") +
+  labs(title = "Confusion Matrix — LASSO")
+
+dir.create("outputs", showWarnings = FALSE)
+ggsave("outputs/lasso_roc.png", roc_plot, width = 6, height = 5, dpi = 300)
+ggsave("outputs/lasso_confmat.png", cm_plot, width = 6, height = 5, dpi = 300)
+write_csv(coefs, "outputs/lasso_coefficients.csv")
+write_csv(metrics, "outputs/lasso_metrics.csv")
+
+message("Saved: lasso_roc.png, lasso_confmat.png, lasso_coefficients.csv, lasso_metrics.csv")
