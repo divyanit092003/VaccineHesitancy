@@ -1,0 +1,135 @@
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(stringr)
+
+excel_path <- "Immunizable Results 20240222 (2).xlsx"
+
+# ---- Helper to find the header row that contains a keyword ----
+find_header_row <- function(df, keyword){
+  hits <- which(apply(df, 1, function(r) any(str_detect(tolower(as.character(r)), keyword))))
+  if(length(hits)) hits[1] else 1
+}
+
+# -------- UTILIZATION (ICU %) --------
+# This sheet is laid out like:
+# Row with "Children 0-19", a column "% Used ICU"
+# Later a section for "Adults", also with "% Used ICU"
+util_raw <- read_excel(excel_path, sheet = "Utilization", col_names = FALSE)
+
+# identify the block for Children and Adults separately
+# 1) Children block
+child_start <- which(str_detect(util_raw[[1]], regex("Disease was principal reason", ignore_case = TRUE)))[1]
+# Heuristic: children % ICU column is near a header "Children 0-19" then "% Used ICU"
+child_header_row <- which(str_detect(apply(util_raw, 1, paste, collapse = " "), "Children 0-19"))[1]
+# Grab a slice of rows that plausibly contain children table
+child_tbl <- util_raw %>% slice((child_header_row):(child_header_row+200))
+
+# Extract columns: Disease, Children_%ICU, Children_Admissions (if present)
+child_tbl2 <- child_tbl %>%
+  rownames_to_column("rowid") %>%
+  mutate(across(everything(), as.character)) %>%
+  replace(is.na(.), "") %>%
+  # mark the start of the disease list
+  mutate(is_disease = str_detect(`...1`, "^[A-Za-z]")) %>%
+  # Keep rows that have disease names (heuristic based on sheet: column 1 lists diseases)
+  filter(is_disease) %>%
+  transmute(
+    disease = str_squish(`...1`),
+    # % ICU usually sits in column 2 for children (based on your sheet preview)
+    icu_pct_children = suppressWarnings(as.numeric(str_extract(`...2`, "[0-9.]+"))),
+    # try to capture a total/icu pair like "1234 (5678)" from a later column if present
+    icu_num_children = suppressWarnings(as.numeric(str_extract(`...21`, "^[0-9]+"))),
+    total_children    = suppressWarnings(as.numeric(str_extract(`...21`, "(?<=\\()[0-9]+(?=\\))")))
+  ) %>%
+  filter(!is.na(icu_pct_children) | !is.na(icu_num_children) | !is.na(total_children))
+
+# 2) Adults block (search for a line that mentions Adults and then similar structure)
+adult_header_row <- which(str_detect(apply(util_raw, 1, paste, collapse = " "), "\\bAdults\\b"))[1]
+adult_tbl <- util_raw %>% slice((adult_header_row):(adult_header_row+250))
+adult_tbl2 <- adult_tbl %>%
+  rownames_to_column("rowid") %>%
+  mutate(across(everything(), as.character)) %>%
+  replace(is.na(.), "") %>%
+  mutate(is_disease = str_detect(`...1`, "^[A-Za-z]")) %>%
+  filter(is_disease) %>%
+  transmute(
+    disease = str_squish(`...1`),
+    icu_pct_adults = suppressWarnings(as.numeric(str_extract(`...2`, "[0-9.]+"))),
+    icu_num_adults = suppressWarnings(as.numeric(str_extract(`...21`, "^[0-9]+"))),
+    total_adults   = suppressWarnings(as.numeric(str_extract(`...21`, "(?<=\\()[0-9]+(?=\\))")))
+  ) %>%
+  filter(!is.na(icu_pct_adults) | !is.na(icu_num_adults) | !is.na(total_adults))
+
+util_tidy <- full_join(child_tbl2, adult_tbl2, by = "disease") %>%
+  mutate(disease = str_replace_all(disease, "\\s+", " ")) %>%
+  distinct()
+
+# -------- REASON (to confirm vaccine-preventable diseases + counts) --------
+reason_raw <- read_excel(excel_path, sheet = "Reason", col_names = FALSE)
+
+# Children block in Reason (part 1)
+reason_child_header <- which(str_detect(apply(reason_raw, 1, paste, collapse = " "),
+                                        "Reason and Utilization by Disease (Children)"))[1]
+reason_child <- reason_raw %>% slice(reason_child_header:(reason_child_header+200)) %>%
+  mutate(across(everything(), as.character)) %>% replace(is.na(.), "") %>%
+  filter(str_detect(`...1`, "^[A-Za-z]")) %>%
+  transmute(
+    disease = str_squish(`...1`),
+    child_admissions = suppressWarnings(as.numeric(`...5`))  # based on your preview, measles "25" sat in col 2, but later columns contain totals; adjust if needed
+  )
+
+# Adults block in Reason (part 2) — search for "Adults" within Reason
+reason_adult_header <- which(str_detect(apply(reason_raw, 1, paste, collapse = " "),
+                                        "\\(Adults\\)"))[1]
+reason_adult <- reason_raw %>% slice(reason_adult_header:(reason_adult_header+200)) %>%
+  mutate(across(everything(), as.character)) %>% replace(is.na(.), "") %>%
+  filter(str_detect(`...1`, "^[A-Za-z]")) %>%
+  transmute(
+    disease = str_squish(`...1`),
+    adult_admissions = suppressWarnings(as.numeric(`...5`))
+  )
+
+reason_tidy <- full_join(reason_child, reason_adult, by = "disease") %>%
+  mutate(disease = str_replace_all(disease, "\\s+", " ")) %>%
+  distinct()
+
+# ---- MERGE Utilization + Reason
+vax_model_tbl <- util_tidy %>%
+  full_join(reason_tidy, by = "disease") %>%
+  mutate(
+    icu_pct_children = if_else(is.na(icu_pct_children), 0, icu_pct_children),
+    icu_pct_adults   = if_else(is.na(icu_pct_adults),   0, icu_pct_adults)
+  ) %>%
+  # Make long by Age group so we can model: each row = Disease x AgeGroup
+  pivot_longer(
+    cols = c(icu_pct_children, icu_pct_adults, icu_num_children, total_children, icu_num_adults, total_adults, child_admissions, adult_admissions),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  separate(metric, into = c("metric", "age"), sep = "_(children|adults)$", remove = FALSE, extra = "merge", fill = "right") %>%
+  mutate(age_group = case_when(
+    str_detect(metric, "children") ~ "Children",
+    str_detect(metric, "adults")   ~ "Adults",
+    TRUE ~ NA_character_
+  )) %>%
+  # Reshape wide per age_group
+  separate(metric, into = c("base_metric","age_tag"), sep = "_", fill = "right") %>%
+  select(disease, age_group, base_metric, value) %>%
+  pivot_wider(names_from = base_metric, values_from = value) %>%
+  clean_names()
+
+# Create modeling variables
+vax_model_tbl <- vax_model_tbl %>%
+  mutate(
+    icu_pct = coalesce(icu_pct, 0),
+    admissions = coalesce(child_admissions, adult_admissions),
+    age_group = factor(age_group, levels = c("Children","Adults")),
+    # Target: ICU utilization high (>=10% threshold; tweak as needed)
+    icu_high = factor(if_else(icu_pct >= 10, 1, 0))
+  ) %>%
+  select(disease, age_group, icu_pct, admissions, icu_high) %>%
+  distinct()
+
+write_csv(vax_model_tbl, "outputs_vax_model_table.csv")
+message("Saved tidy table: outputs_vax_model_table.csv")
